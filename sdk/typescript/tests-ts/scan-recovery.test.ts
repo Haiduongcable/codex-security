@@ -1024,6 +1024,63 @@ describe("malformed scan artifact recovery", () => {
     });
   });
 
+  test("prunes non-string evidenceRefs entries instead of crashing recovery", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+    const valid = document.findings[0]!;
+
+    // codeEvidence is malformed so it gets stripped, and evidenceRefs mixes a
+    // valid string with unhashable (object/array) and non-string (number)
+    // garbage that a malfunctioning producer could emit. Recovery must prune
+    // these rather than crash when testing set membership.
+    const garbageRefs = structuredClone(valid);
+    garbageRefs.identity.anchor = "garbage-evidence-refs";
+    (garbageRefs as Record<string, unknown>)["codeEvidence"] = [
+      {
+        id: "ev1",
+        label: "sink",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+      },
+    ];
+    (garbageRefs as Record<string, unknown>)["rootCause"] = {
+      summary: "Non-string evidenceRefs regression check.",
+      evidenceRefs: ["ev1", { nested: "garbage" }, ["nested", "garbage"], 42],
+    };
+
+    document.findings.push(garbageRefs);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(2);
+    expect(
+      completed.warnings.some((warning) =>
+        warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling rootCause.evidenceRefs"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings;
+    const garbageRefsRecovered = recovered.find(
+      (finding) => finding?.identity.anchor === "garbage-evidence-refs",
+    );
+    expect(garbageRefsRecovered).toBeDefined();
+    expect(garbageRefsRecovered).not.toHaveProperty("codeEvidence");
+    expect(
+      (garbageRefsRecovered as Record<string, unknown>)?.["rootCause"],
+    ).toMatchObject({ evidenceRefs: [] });
+  });
+
   test("keeps verified coverage receipts and downgrades invalid coverage", async () => {
     const fixture = await startDraftScan();
     const path = join(fixture.scanDir, "coverage.json");

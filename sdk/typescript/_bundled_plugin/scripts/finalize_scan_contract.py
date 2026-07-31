@@ -915,7 +915,9 @@ def _recover_unsealed_findings(
                 refs = section.get("evidenceRefs")
                 if not isinstance(refs, list):
                     continue
-                kept_refs = [ref for ref in refs if ref in known_evidence_ids]
+                kept_refs = [
+                    ref for ref in refs if isinstance(ref, str) and ref in known_evidence_ids
+                ]
                 if len(kept_refs) != len(refs):
                     section["evidenceRefs"] = kept_refs
                     warnings.append(
