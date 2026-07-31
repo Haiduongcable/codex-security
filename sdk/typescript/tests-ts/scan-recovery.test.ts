@@ -916,14 +916,49 @@ describe("malformed scan artifact recovery", () => {
       evidenceRefs: ["ev1"],
     };
 
-    document.findings.push(missingCwe, malformedEvidence);
+    // A codeEvidence malformation caught by the hand-rolled validator itself
+    // (duplicate ids), not only by the JSON-schema pass, plus a dangling
+    // reference in the nested `attackPath.dataflow.evidenceRefs` location.
+    const duplicateEvidence = structuredClone(valid);
+    duplicateEvidence.identity.anchor = "duplicate-evidence";
+    (duplicateEvidence as Record<string, unknown>)["codeEvidence"] = [
+      {
+        id: "ev1",
+        label: "a",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+        explanation: "first",
+      },
+      {
+        id: "ev1",
+        label: "b",
+        path: "src/extract.py",
+        startLine: 2,
+        code: "y = 2",
+        explanation: "second",
+      },
+    ];
+    (duplicateEvidence as Record<string, unknown>)["attackPath"] = {
+      summary: "Nested dangling reference regression check.",
+      dataflow: {
+        summary: "source -> sink",
+        source: "input",
+        sink: "output",
+        outcome: "impact",
+        evidenceRefs: ["ev1"],
+      },
+      evidenceRefs: ["ev1"],
+    };
+
+    document.findings.push(missingCwe, malformedEvidence, duplicateEvidence);
     await writeJson(path, document);
 
     const completed = await completeScan(fixture);
 
     expect(completed.progress.status).toBe("complete");
-    expect(completed.findingCount).toBe(3);
-    expect(completed.warnings).toHaveLength(3);
+    expect(completed.findingCount).toBe(4);
+    expect(completed.warnings).toHaveLength(6);
     expect(
       completed.warnings.some(
         (warning) =>
@@ -932,15 +967,29 @@ describe("malformed scan artifact recovery", () => {
       ),
     ).toBe(true);
     expect(
-      completed.warnings.some((warning) =>
+      completed.warnings.filter((warning) =>
         warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toHaveLength(2);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling rootCause.evidenceRefs"),
       ),
     ).toBe(true);
     expect(
       completed.warnings.some(
         (warning) =>
           warning.includes("Recovered finding") &&
-          warning.includes("dropped dangling rootCause.evidenceRefs"),
+          warning.includes("dropped dangling attackPath.evidenceRefs"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling attackPath.dataflow.evidenceRefs"),
       ),
     ).toBe(true);
 
@@ -961,6 +1010,18 @@ describe("malformed scan artifact recovery", () => {
     expect(
       (malformedEvidenceRecovered as Record<string, unknown>)?.["rootCause"],
     ).toMatchObject({ evidenceRefs: [] });
+
+    const duplicateEvidenceRecovered = recovered.find(
+      (finding) => finding?.identity.anchor === "duplicate-evidence",
+    );
+    expect(duplicateEvidenceRecovered).toBeDefined();
+    expect(duplicateEvidenceRecovered).not.toHaveProperty("codeEvidence");
+    expect(
+      (duplicateEvidenceRecovered as Record<string, unknown>)?.["attackPath"],
+    ).toMatchObject({
+      evidenceRefs: [],
+      dataflow: { evidenceRefs: [] },
+    });
   });
 
   test("keeps verified coverage receipts and downgrades invalid coverage", async () => {

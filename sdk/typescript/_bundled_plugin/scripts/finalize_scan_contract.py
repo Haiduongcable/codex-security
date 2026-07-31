@@ -796,11 +796,14 @@ def _recover_unsealed_findings(
     writeup_schema = _require_dict(
         finding_properties, "writeup", "findings.schema.properties.findings.items.properties"
     )
+    code_evidence_schema = _require_dict(
+        finding_properties, "codeEvidence", "findings.schema.properties.findings.items.properties"
+    )
     auxiliary_schemas = {
         name: _require_dict(
             finding_properties, name, "findings.schema.properties.findings.items.properties"
         )
-        for name in ("remediationTests", "preventiveControls", "codeEvidence")
+        for name in ("remediationTests", "preventiveControls")
     }
     scan = _require_dict(manifest, "scan", "manifest")
     scan_id = _require_str(scan, "id", "manifest.scan")
@@ -863,6 +866,63 @@ def _recover_unsealed_findings(
             )
             finding_id = finding["findingId"]
             previous_position = finding_positions.get(finding_id)
+
+            if "codeEvidence" in finding:
+                try:
+                    _validate_schema_node(
+                        finding["codeEvidence"], code_evidence_schema, f"{context}.codeEvidence"
+                    )
+                    seen_evidence_ids: set[str] = set()
+                    for evidence_index, evidence in enumerate(finding["codeEvidence"]):
+                        evidence_id = evidence["id"]
+                        if evidence_id in seen_evidence_ids:
+                            raise ContractError(
+                                f"{context}.codeEvidence[{evidence_index}].id: "
+                                "duplicate code-evidence id"
+                            )
+                        seen_evidence_ids.add(evidence_id)
+                except ContractError as exc:
+                    finding.pop("codeEvidence")
+                    warnings.append(
+                        f"Skipped malformed codeEvidence for finding {index + 1}: {exc}."
+                    )
+
+            taxonomy = finding.get("taxonomy")
+            if isinstance(taxonomy, dict) and "cwe" not in taxonomy:
+                taxonomy["cwe"] = []
+                warnings.append(
+                    f"Recovered finding {index + 1}: backfilled missing taxonomy.cwe with an empty list."
+                )
+
+            known_evidence_ids = {
+                evidence["id"]
+                for evidence in finding.get("codeEvidence") or []
+                if isinstance(evidence, dict) and isinstance(evidence.get("id"), str)
+            }
+            attack_path = finding.get("attackPath")
+            evidence_ref_sections = [
+                (finding.get("rootCause"), "rootCause"),
+                (finding.get("validation"), "validation"),
+                (attack_path, "attackPath"),
+            ]
+            if isinstance(attack_path, dict):
+                evidence_ref_sections.append(
+                    (attack_path.get("dataflow"), "attackPath.dataflow")
+                )
+            for section, section_name in evidence_ref_sections:
+                if not isinstance(section, dict):
+                    continue
+                refs = section.get("evidenceRefs")
+                if not isinstance(refs, list):
+                    continue
+                kept_refs = [ref for ref in refs if ref in known_evidence_ids]
+                if len(kept_refs) != len(refs):
+                    section["evidenceRefs"] = kept_refs
+                    warnings.append(
+                        f"Recovered finding {index + 1}: dropped dangling {section_name}.evidenceRefs "
+                        "after codeEvidence recovery."
+                    )
+
             _validate_finding(finding, context)
             if "writeup" in finding:
                 try:
@@ -893,34 +953,6 @@ def _recover_unsealed_findings(
                     warnings.append(
                         f"Skipped malformed {auxiliary} for finding {index + 1}: {exc}."
                     )
-
-            taxonomy = finding.get("taxonomy")
-            if isinstance(taxonomy, dict) and "cwe" not in taxonomy:
-                taxonomy["cwe"] = []
-                warnings.append(
-                    f"Recovered finding {index + 1}: backfilled missing taxonomy.cwe with an empty list."
-                )
-
-            known_evidence_ids = {
-                evidence["id"]
-                for evidence in finding.get("codeEvidence") or []
-                if isinstance(evidence, dict) and isinstance(evidence.get("id"), str)
-            }
-            for section_name in ("rootCause", "validation", "attackPath"):
-                section = finding.get(section_name)
-                if not isinstance(section, dict):
-                    continue
-                refs = section.get("evidenceRefs")
-                if not isinstance(refs, list):
-                    continue
-                kept_refs = [ref for ref in refs if ref in known_evidence_ids]
-                if len(kept_refs) != len(refs):
-                    section["evidenceRefs"] = kept_refs
-                    warnings.append(
-                        f"Recovered finding {index + 1}: dropped dangling {section_name}.evidenceRefs "
-                        "after codeEvidence recovery."
-                    )
-
             _validate_schema_node(finding, finding_schema, context)
         except ContractError as exc:
             warning = f"Skipped malformed finding {index + 1}: {exc}."
