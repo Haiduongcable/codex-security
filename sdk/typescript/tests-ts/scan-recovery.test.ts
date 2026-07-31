@@ -886,6 +886,83 @@ describe("malformed scan artifact recovery", () => {
     }
   });
 
+  test("keeps findings while recovering missing taxonomy CWE and malformed code evidence", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+    const valid = document.findings[0]!;
+
+    const missingCwe = structuredClone(valid);
+    missingCwe.identity.anchor = "missing-cwe";
+    const missingCweTaxonomy = (missingCwe as Record<string, unknown>)[
+      "taxonomy"
+    ] as Partial<{ cwe: string[] }>;
+    delete missingCweTaxonomy.cwe;
+
+    const malformedEvidence = structuredClone(valid);
+    malformedEvidence.identity.anchor = "malformed-evidence";
+    (malformedEvidence as Record<string, unknown>)["codeEvidence"] = [
+      // Missing the required `explanation` field.
+      {
+        id: "ev1",
+        label: "sink",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+      },
+    ];
+    (malformedEvidence as Record<string, unknown>)["rootCause"] = {
+      summary: "Dangling reference regression check.",
+      evidenceRefs: ["ev1"],
+    };
+
+    document.findings.push(missingCwe, malformedEvidence);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(3);
+    expect(completed.warnings).toHaveLength(3);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("backfilled missing taxonomy.cwe"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some((warning) =>
+        warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling rootCause.evidenceRefs"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings;
+    const missingCweRecovered = recovered.find(
+      (finding) => finding?.identity.anchor === "missing-cwe",
+    );
+    expect(missingCweRecovered).toBeDefined();
+    expect(
+      (missingCweRecovered as Record<string, unknown>)?.["taxonomy"],
+    ).toMatchObject({ cwe: [] });
+
+    const malformedEvidenceRecovered = recovered.find(
+      (finding) => finding?.identity.anchor === "malformed-evidence",
+    );
+    expect(malformedEvidenceRecovered).toBeDefined();
+    expect(malformedEvidenceRecovered).not.toHaveProperty("codeEvidence");
+    expect(
+      (malformedEvidenceRecovered as Record<string, unknown>)?.["rootCause"],
+    ).toMatchObject({ evidenceRefs: [] });
+  });
+
   test("keeps verified coverage receipts and downgrades invalid coverage", async () => {
     const fixture = await startDraftScan();
     const path = join(fixture.scanDir, "coverage.json");

@@ -800,7 +800,7 @@ def _recover_unsealed_findings(
         name: _require_dict(
             finding_properties, name, "findings.schema.properties.findings.items.properties"
         )
-        for name in ("remediationTests", "preventiveControls")
+        for name in ("remediationTests", "preventiveControls", "codeEvidence")
     }
     scan = _require_dict(manifest, "scan", "manifest")
     scan_id = _require_str(scan, "id", "manifest.scan")
@@ -893,6 +893,34 @@ def _recover_unsealed_findings(
                     warnings.append(
                         f"Skipped malformed {auxiliary} for finding {index + 1}: {exc}."
                     )
+
+            taxonomy = finding.get("taxonomy")
+            if isinstance(taxonomy, dict) and "cwe" not in taxonomy:
+                taxonomy["cwe"] = []
+                warnings.append(
+                    f"Recovered finding {index + 1}: backfilled missing taxonomy.cwe with an empty list."
+                )
+
+            known_evidence_ids = {
+                evidence["id"]
+                for evidence in finding.get("codeEvidence") or []
+                if isinstance(evidence, dict) and isinstance(evidence.get("id"), str)
+            }
+            for section_name in ("rootCause", "validation", "attackPath"):
+                section = finding.get(section_name)
+                if not isinstance(section, dict):
+                    continue
+                refs = section.get("evidenceRefs")
+                if not isinstance(refs, list):
+                    continue
+                kept_refs = [ref for ref in refs if ref in known_evidence_ids]
+                if len(kept_refs) != len(refs):
+                    section["evidenceRefs"] = kept_refs
+                    warnings.append(
+                        f"Recovered finding {index + 1}: dropped dangling {section_name}.evidenceRefs "
+                        "after codeEvidence recovery."
+                    )
+
             _validate_schema_node(finding, finding_schema, context)
         except ContractError as exc:
             warning = f"Skipped malformed finding {index + 1}: {exc}."
