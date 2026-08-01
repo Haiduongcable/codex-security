@@ -42,6 +42,7 @@
     "scripts/validate_report_format.py",
     "scripts/validate_scan_contract.py",
     "scripts/validate_tracking_source.py",
+    "scripts/variant_analysis.py",
     "scripts/windows_scan_local_files.py",
     "scripts/workbench_cli.py",
     "scripts/workbench_constants.py",
@@ -95,6 +96,9 @@
     "skills/validation/SKILL.md",
     "skills/validation/agents/openai.yaml",
     "skills/validation/references/validation-guidance.md",
+    "skills/variant-analysis/SKILL.md",
+    "skills/variant-analysis/agents/openai.yaml",
+    "skills/variant-analysis/references/variant-analysis-guidance.md",
     "skills/vulnerability-writeup/SKILL.md",
     "skills/vulnerability-writeup/agents/openai.yaml",
     "skills/vulnerability-writeup/references/report-format.md"
