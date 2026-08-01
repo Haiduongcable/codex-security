@@ -24,6 +24,7 @@
     "references/security-guidance.md",
     "references/shared-hard-rules.md",
     "references/static-finding-assessment.md",
+    "references/vulnerability-classes.md",
     "schemas/coverage.schema.json",
     "schemas/definitions/artifact-common.schema.json",
     "schemas/definitions/discovery-candidate.schema.json",
