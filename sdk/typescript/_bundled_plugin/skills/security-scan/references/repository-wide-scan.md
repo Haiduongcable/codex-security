@@ -15,6 +15,16 @@ Follow `nextCursor` until every repository-relative review item has been returne
 
 For an app scan, keep `reviewItemsTotal` at zero while building the file list. Then publish the file count, review files in batches, and update `reviewItemsCompleted` after each batch.
 
+Then inventory the remote entry points deterministically:
+
+```text
+<python_command> <plugin_dir>/scripts/inventory_entry_points.py --repo <repo_root> --out <discovery_dir>/entry_points.jsonl --summary <discovery_dir>/entry_points.json
+```
+
+Each row reports a `path`, `line`, `kind` (`http_route`, `graphql`, `serverless_handler`, `message_consumer`, `server_bind`, or `ci_trigger`), `framework`, and the matching `evidence`. Use it to order the review so files carrying untrusted-input entry points are read first, and to trace inward from an entry point rather than outward from a sink.
+
+This is a prior, not a verdict, and it is not a scope filter. Every file in `in_scope_files.txt` is still reviewed. A file with no entry point can still hold a reachable bug through a helper, and a file with one is not vulnerable by virtue of having it.
+
 For an SDK or terminal scan with `CODEX_SECURITY_SCAN_ID`, emit this standalone line in an agent message or completed command output after building the file list, after each completed review batch, and when entering validation, attack-path analysis, or reporting:
 
 ```text

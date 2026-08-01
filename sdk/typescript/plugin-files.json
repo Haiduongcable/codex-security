@@ -45,6 +45,7 @@
     "scripts/finding_preview.py",
     "scripts/generate_in_scope_files.py",
     "scripts/generate_rank_input.py",
+    "scripts/inventory_entry_points.py",
     "scripts/normalize_candidates.py",
     "scripts/rank_preview.py",
     "scripts/report_projection.py",
