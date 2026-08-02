@@ -35,11 +35,8 @@ Use a user-provided output directory when supplied. Otherwise create a temporary
 6. Write raw candidate locations as JSONL with the fields accepted by `../../scripts/variant_analysis.py build-worklist`. Include one row per concrete location; the helper merges repeated locations, preserves every search rationale, and assigns stable IDs.
 7. Run:
 
-   ```bash
-   <python_command> <plugin_dir>/scripts/variant_analysis.py build-worklist \
-     --repo-root <repo_root> \
-     --input <raw_candidates.jsonl> \
-     --out <variant_worklist.jsonl>
+   ```text
+   <python_command> <plugin_dir>/scripts/variant_analysis.py build-worklist --repo-root <repo_root> --input <raw_candidates.jsonl> --out <variant_worklist.jsonl>
    ```
 
 8. Review every worklist row against the complete source-to-sink path and the repository's intended security boundary. Record provisional evidence, but do not write or verify final receipts yet.
@@ -59,11 +56,8 @@ Use a user-provided output directory when supplied. Otherwise create a temporary
     - use `distinct_issue` only when the evidence supports a security issue with a different root cause
 11. Run:
 
-   ```bash
-   <python_command> <plugin_dir>/scripts/variant_analysis.py verify-ledger \
-     --worklist <variant_worklist.jsonl> \
-     --receipts <variant_receipts.jsonl> \
-     --out <variant_summary.json>
+   ```text
+   <python_command> <plugin_dir>/scripts/variant_analysis.py verify-ledger --worklist <variant_worklist.jsonl> --receipts <variant_receipts.jsonl> --out <variant_summary.json>
    ```
 
    Do not claim completion unless this command succeeds after all required downstream phases finish.

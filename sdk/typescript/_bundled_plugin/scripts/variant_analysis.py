@@ -35,6 +35,14 @@ DISPOSITIONS = {
     "deferred",
 }
 CANDIDATE_FIELDS = {"path", "start_line", "symbol", "search_dimension", "rationale"}
+WORKLIST_FIELDS = {
+    "candidate_id",
+    "path",
+    "start_line",
+    "symbol",
+    "search_dimensions",
+    "rationales",
+}
 RECEIPT_FIELDS = {"candidate_id", "disposition", "reason", "evidence", "proof"}
 PROOF_FIELDS = {"source", "control", "sink", "impact"}
 ID_PATTERN = re.compile(r"^variant-[0-9a-f]{16}$")
@@ -79,9 +87,9 @@ def destination_path(value: str) -> Path:
     return requested.resolve(strict=False)
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
+def read_jsonl(path: Path) -> list[tuple[int, dict[str, Any]]]:
     safe_source(path)
-    rows: list[dict[str, Any]] = []
+    rows: list[tuple[int, dict[str, Any]]] = []
     with path.open(encoding="utf-8") as handle:
         for number, line in enumerate(handle, 1):
             if not line.strip():
@@ -94,7 +102,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path} row {number}: invalid JSON: {error.msg}") from error
             if not isinstance(value, dict):
                 raise ValueError(f"{path} row {number}: expected a JSON object")
-            rows.append(value)
+            rows.append((number, value))
     return rows
 
 
@@ -165,10 +173,10 @@ def atomic_write(path: Path, payload: str) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", newline="\n", dir=path.parent, delete=False
         ) as handle:
+            temporary = Path(handle.name)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-            temporary = Path(handle.name)
         temporary.replace(path)
     finally:
         if temporary is not None and temporary.exists():
@@ -195,7 +203,7 @@ def build_worklist(args: argparse.Namespace) -> None:
         total_rows += len(rows)
         if total_rows > MAX_ROWS:
             raise ValueError(f"combined inputs exceed {MAX_ROWS} rows")
-        for number, row in enumerate(rows, 1):
+        for number, row in rows:
             try:
                 candidate = normalize_candidate(row, repo_root, line_counts)
             except (OSError, ValueError) as error:
@@ -265,25 +273,74 @@ def normalize_receipt(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def normalize_worklist_id(row: dict[str, Any]) -> str:
+    if set(row) != WORKLIST_FIELDS:
+        raise ValueError("expected exactly the build-worklist fields")
+    candidate_id = text(row["candidate_id"], "candidate_id")
+    if ID_PATTERN.fullmatch(candidate_id) is None:
+        raise ValueError("invalid candidate_id")
+    path = text(row["path"], "path")
+    relative = PurePosixPath(path)
+    if (
+        path != row["path"]
+        or "\0" in path
+        or "\\" in path
+        or relative.is_absolute()
+        or not relative.parts
+        or relative.as_posix() != path
+        or ".." in relative.parts
+        or any(":" in part for part in relative.parts)
+    ):
+        raise ValueError("path: expected a safe repository-relative POSIX path")
+    start_line = positive_line(row["start_line"])
+    symbol = text(row["symbol"], "symbol")
+    if symbol != row["symbol"]:
+        raise ValueError("symbol: expected canonical text")
+    dimensions = row["search_dimensions"]
+    if not isinstance(dimensions, list) or not dimensions:
+        raise ValueError("search_dimensions: expected a non-empty array")
+    normalized_dimensions = [text(item, "search_dimensions item") for item in dimensions]
+    if any(item not in DIMENSIONS for item in normalized_dimensions):
+        raise ValueError("search_dimensions: contains an unsupported value")
+    if normalized_dimensions != dimensions or normalized_dimensions != sorted(
+        set(normalized_dimensions)
+    ):
+        raise ValueError("search_dimensions: expected sorted unique values")
+    rationales = row["rationales"]
+    if not isinstance(rationales, list) or not rationales:
+        raise ValueError("rationales: expected a non-empty array")
+    normalized_rationales = [text(item, "rationales item") for item in rationales]
+    if normalized_rationales != rationales or normalized_rationales != sorted(
+        set(normalized_rationales)
+    ):
+        raise ValueError("rationales: expected sorted unique values")
+    identity = candidate_identity(
+        {"path": path, "start_line": start_line, "symbol": symbol}
+    )
+    expected = f"variant-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+    if candidate_id != expected:
+        raise ValueError("candidate_id does not match row content")
+    return candidate_id
+
+
 def verify_ledger(args: argparse.Namespace) -> None:
     worklist_path = source_path(args.worklist)
     receipts_path = source_path(args.receipts)
     output = destination_path(args.out)
     if output in {worklist_path, receipts_path}:
         raise ValueError("--out: must not replace an input")
-    worklist_rows = read_jsonl(worklist_path)
     worklist_ids: list[str] = []
-    for number, row in enumerate(worklist_rows, 1):
-        candidate_id = row.get("candidate_id")
-        if not isinstance(candidate_id, str) or ID_PATTERN.fullmatch(candidate_id) is None:
-            raise ValueError(f"{worklist_path} row {number}: invalid candidate_id")
-        worklist_ids.append(candidate_id)
+    for number, row in read_jsonl(worklist_path):
+        try:
+            worklist_ids.append(normalize_worklist_id(row))
+        except ValueError as error:
+            raise ValueError(f"{worklist_path} row {number}: {error}") from error
     duplicate_work = sorted(key for key, count in Counter(worklist_ids).items() if count > 1)
     if duplicate_work:
         raise ValueError(f"worklist contains duplicate candidate IDs: {', '.join(duplicate_work)}")
 
     receipts: list[dict[str, Any]] = []
-    for number, row in enumerate(read_jsonl(receipts_path), 1):
+    for number, row in read_jsonl(receipts_path):
         try:
             receipts.append(normalize_receipt(row))
         except ValueError as error:

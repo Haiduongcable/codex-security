@@ -1,4 +1,11 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -154,11 +161,14 @@ describe("variant analysis ledger helper", () => {
       join(tmpdir(), "codex-security-variants-invalid-"),
     );
     try {
+      const repo = join(root, "repo");
       const outside = join(root, "outside.jsonl");
       const badLine = join(root, "bad-line.jsonl");
       const linkedInput = join(root, "linked.jsonl");
       const output = join(root, "worklist.jsonl");
-      await writeFile(join(root, "source.py"), "pass\n");
+      await mkdir(repo);
+      await writeFile(join(repo, "source.py"), "pass\n");
+      await writeFile(join(root, "external.py"), "pass\n");
       const base = {
         symbol: "candidate",
         search_dimension: "semantic_alias",
@@ -171,7 +181,7 @@ describe("variant analysis ledger helper", () => {
       let result = run([
         "build-worklist",
         "--repo-root",
-        root,
+        repo,
         "--input",
         outside,
         "--out",
@@ -184,12 +194,12 @@ describe("variant analysis ledger helper", () => {
 
       await writeFile(
         badLine,
-        `${JSON.stringify({ ...base, path: "source.py", start_line: 2 })}\n`,
+        `\n${JSON.stringify({ ...base, path: "source.py", start_line: 2 })}\n`,
       );
       result = run([
         "build-worklist",
         "--repo-root",
-        root,
+        repo,
         "--input",
         badLine,
         "--out",
@@ -197,14 +207,34 @@ describe("variant analysis ledger helper", () => {
       ]);
       expect(result.exitCode).toBe(1);
       expect(result.stderr.toString()).toContain(
-        "start_line: exceeds source.py",
+        "row 2: start_line: exceeds source.py",
+      );
+
+      const escapedSource = join(repo, "escaped.py");
+      await symlink(join(root, "external.py"), escapedSource);
+      await writeFile(
+        badLine,
+        `${JSON.stringify({ ...base, path: "escaped.py", start_line: 1 })}\n`,
+      );
+      result = run([
+        "build-worklist",
+        "--repo-root",
+        repo,
+        "--input",
+        badLine,
+        "--out",
+        output,
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain(
+        "must resolve inside --repo-root",
       );
 
       await symlink(badLine, linkedInput);
       result = run([
         "build-worklist",
         "--repo-root",
-        root,
+        repo,
         "--input",
         linkedInput,
         "--out",
@@ -261,18 +291,81 @@ describe("variant analysis ledger helper", () => {
     }
   });
 
+  test("certifies exact closure for an intentionally empty candidate set", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "codex-security-variants-empty-"),
+    );
+    try {
+      const candidates = join(root, "candidates.jsonl");
+      const worklist = join(root, "worklist.jsonl");
+      const receipts = join(root, "receipts.jsonl");
+      const summary = join(root, "summary.json");
+      await writeFile(candidates, "");
+      await writeFile(receipts, "");
+      expect(
+        run([
+          "build-worklist",
+          "--repo-root",
+          root,
+          "--input",
+          candidates,
+          "--out",
+          worklist,
+        ]).exitCode,
+      ).toBe(0);
+      expect(
+        run([
+          "verify-ledger",
+          "--worklist",
+          worklist,
+          "--receipts",
+          receipts,
+          "--out",
+          summary,
+        ]).exitCode,
+      ).toBe(0);
+      expect(JSON.parse(await readFile(summary, "utf8"))).toMatchObject({
+        complete: true,
+        total_candidates: 0,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed for missing, duplicate, and unknown receipts", async () => {
     const root = await mkdtemp(
       join(tmpdir(), "codex-security-variants-ledger-"),
     );
     try {
       const worklist = join(root, "worklist.jsonl");
+      const candidates = join(root, "candidates.jsonl");
       const receipts = join(root, "receipts.jsonl");
       const summary = join(root, "summary.json");
-      const candidateId = "variant-0123456789abcdef";
+      await writeFile(join(root, "source.ts"), "export const value = 1;\n");
       await writeFile(
-        worklist,
-        `${JSON.stringify({ candidate_id: candidateId })}\n`,
+        candidates,
+        `${JSON.stringify({
+          path: "source.ts",
+          start_line: 1,
+          symbol: "value",
+          search_dimension: "same_sink",
+          rationale: "Reaches the same protected operation.",
+        })}\n`,
+      );
+      expect(
+        run([
+          "build-worklist",
+          "--repo-root",
+          root,
+          "--input",
+          candidates,
+          "--out",
+          worklist,
+        ]).exitCode,
+      ).toBe(0);
+      const candidateId = String(
+        (await jsonLines(worklist))[0]!["candidate_id"],
       );
       await writeFile(receipts, "");
       let result = run([
@@ -295,6 +388,21 @@ describe("variant analysis ledger helper", () => {
         reason: "An effective control defeats the path.",
         evidence: ["source.ts:1"],
       };
+      await writeFile(receipts, `${JSON.stringify(receipt)}\n`);
+      result = run([
+        "verify-ledger",
+        "--worklist",
+        receipts,
+        "--receipts",
+        receipts,
+        "--out",
+        summary,
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain(
+        "expected exactly the build-worklist fields",
+      );
+
       await writeFile(
         receipts,
         `${JSON.stringify(receipt)}\n${JSON.stringify(receipt)}\n`,
@@ -327,6 +435,27 @@ describe("variant analysis ledger helper", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stderr.toString()).toContain(
         "only confirmed_variant receipts may include proof",
+      );
+
+      await writeFile(
+        receipts,
+        `${JSON.stringify({
+          ...receipt,
+          disposition: "confirmed_variant",
+        })}\n`,
+      );
+      result = run([
+        "verify-ledger",
+        "--worklist",
+        worklist,
+        "--receipts",
+        receipts,
+        "--out",
+        summary,
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain(
+        "confirmed_variant requires exactly source, control, sink, and impact",
       );
 
       await writeFile(
