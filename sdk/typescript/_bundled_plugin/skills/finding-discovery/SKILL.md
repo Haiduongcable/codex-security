@@ -20,6 +20,8 @@ Use the shared scan artifact path conventions in `../../references/scan-artifact
 
 Read `../../references/security-guidance.md` and resolve the applicable policy before inspecting each source file. A delegated file-review worker must do the same before reading its assigned source.
 
+Consult `../../references/vulnerability-classes.md` for classes the checklist below does not name, including concurrency and TOCTOU, workflow injection, prototype pollution, mass assignment, business-logic and authorization gaps, CORS, token validation, infrastructure configuration, and GraphQL. Each entry states the specific control that defeats it; suppress an instance only by naming that control in the code you read.
+
 ### Code Diff Workflow
 If the scan target is for a targeted code-diff:
 
@@ -33,7 +35,7 @@ If the scan target is for a targeted code-diff:
 
 ### Exhaustive Repository Or Scoped-Path Workflow
 
-If the scan target is repository-wide or a scoped path, use only the concise detection-first procedure in `../security-scan/references/repository-wide-scan.md`. It replaces the checklist, phase-specific output, and receipt requirements below for standard scans; do not load additional repository-wide ranking, ledger, validation, or attack-path references. The remaining guidance in this skill continues to apply to diff-scoped discovery.
+If the scan target is repository-wide or a scoped path, use only the concise detection-first procedure in `../security-scan/references/repository-wide-scan.md`. Obtain assigned repository source paths with `list_codex_security_review_items`, and record all discovered candidates once with `record_codex_security_discovery_candidates`. A Standard parent includes `scanId`; an independent Deep discovery worker uses its bound worker context. This replaces the checklist, phase-specific output, and receipt requirements below for Standard scans and independent Deep discovery workers; do not load additional repository-wide ranking, ledger, validation, or attack-path references. The remaining guidance in this skill continues to apply to diff-scoped discovery.
 
 ## Discovery Checklist
 
