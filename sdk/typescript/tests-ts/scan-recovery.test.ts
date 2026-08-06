@@ -18,7 +18,7 @@ type Finding = Record<string, unknown> & {
   ruleId: string;
   identity: { anchor: string; instance?: string };
   summary: string;
-  severity: { level: string };
+  severity: { level: string; changeConditions?: unknown };
   confidence: { level: string };
   locations: Array<{ path: string }>;
   codeEvidence?: Array<{
@@ -234,6 +234,54 @@ async function completeScan(fixture: ScanFixture): Promise<ScanSummary> {
 }
 
 describe("malformed scan artifact recovery", () => {
+  test("rejoins a headless scan after its running context changes", async () => {
+    const fixture = await startDraftScan();
+    const threadId = "context-rejoin-regression";
+    const startArguments = [
+      "start-headless-standard-scan",
+      "--thread-id",
+      threadId,
+      "--target-path",
+      fixture.repository,
+      "--scope",
+      ".",
+      "--user-context",
+      "original security focus",
+    ];
+    const created = await workbench(fixture, startArguments);
+    const scan = created["scan"] as {
+      scanId: string;
+      handoffClaimToken: string;
+      userContext: string;
+    };
+
+    const updated = await workbench(fixture, [
+      "update-scan-context",
+      "--scan-id",
+      scan.scanId,
+      "--user-context",
+      "updated security focus",
+      "--thread-id",
+      threadId,
+      "--claim-token",
+      scan.handoffClaimToken,
+    ]);
+    expect(updated["scan"]).toMatchObject({
+      scanId: scan.scanId,
+      userContext: "updated security focus",
+    });
+    expect(updated["workspace"]).toMatchObject({
+      userContext: "updated security focus",
+    });
+
+    const retried = await workbench(fixture, startArguments);
+    expect(retried["startDisposition"]).toBe("joined");
+    expect(retried["scan"]).toMatchObject({
+      scanId: scan.scanId,
+      userContext: "updated security focus",
+    });
+  });
+
   test("returns the authoritative directory snapshot contract at registration", async () => {
     const fixture = await startDraftScan();
     const registration = fixture.registration;
@@ -338,6 +386,31 @@ describe("malformed scan artifact recovery", () => {
     expect((await completeScan(fixture)).progress.status).toBe("complete");
   });
 
+  test("preserves target-drift classification from prepared completion", async () => {
+    const fixture = await startDraftScan();
+    const source = join(fixture.repository, "src", "extract.py");
+    const original = await readFile(source, "utf8");
+    await writeFile(source, "# target changed during scan\n");
+
+    const prepared = await workbench(fixture, [
+      "prepare-scan-completion",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    const warning =
+      "Directory contents changed while the scan was running; results were saved for the original snapshot.";
+    expect(prepared["targetWarnings"]).toEqual([warning]);
+
+    await writeFile(source, original);
+    const completed = await workbench(fixture, [
+      "complete-scan",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    expect((completed["scan"] as ScanSummary).warnings).toContain(warning);
+    expect(completed["targetWarnings"]).toEqual([]);
+  });
+
   test("marks rejected prepared scans as failed without publishing completion", async () => {
     const fixture = await startDraftScan();
     await workbench(fixture, [
@@ -413,15 +486,79 @@ describe("malformed scan artifact recovery", () => {
 
     expect((prepared["scan"] as ScanSummary).progress.status).toBe("running");
     expect((prepared["scan"] as ScanSummary).warnings).toEqual([warning]);
-    const completed = await completeScan(fixture);
+    const completion = await workbench(fixture, [
+      "complete-scan",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    const completed = completion["scan"] as ScanSummary;
     expect(completed.progress.status).toBe("complete");
     expect(completed.warnings).toEqual([warning]);
+    expect(completion["targetWarnings"]).toEqual([]);
     const saved = await workbench(fixture, [
       "get-scan",
       "--scan-id",
       fixture.scanId,
     ]);
     expect((saved["scan"] as ScanSummary).warnings).toEqual([warning]);
+  });
+
+  test("normalizes severity change-condition lists without losing findings", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+    document.findings[0]!.severity.changeConditions = [
+      "Raise if the vulnerable path becomes internet-reachable.",
+      "Lower if the input is constrained before parsing.",
+    ];
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(1);
+    expect(completed.warnings).toEqual([
+      "Recovered finding 1: normalized severity change conditions.",
+    ]);
+    const recovered = (await readJson<FindingsDocument>(path)).findings[0]!;
+    expect(recovered.severity.changeConditions).toBe(
+      "Raise if the vulnerable path becomes internet-reachable. " +
+        "Lower if the input is constrained before parsing.",
+    );
+    const coverage = await readJson<CoverageDocument>(
+      join(fixture.scanDir, "coverage.json"),
+    );
+    expect(coverage.completeness).toBe("complete");
+  });
+
+  test("rejects severity change-condition lists with malformed entries", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+    const valid = document.findings[0]!;
+
+    for (const [anchor, conditions] of [
+      ["empty-severity-conditions", []],
+      ["blank-severity-condition", ["  "]],
+      ["mixed-severity-conditions", ["Valid condition.", 1]],
+      ["surrogate-severity-condition", ["\uD800"]],
+    ] as const) {
+      const finding = structuredClone(valid);
+      finding.identity.anchor = anchor;
+      finding.severity.changeConditions = conditions;
+      document.findings.push(finding);
+    }
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.findingCount).toBe(1);
+    expect(completed.warnings).toHaveLength(4);
+    expect(
+      completed.warnings.every((warning) =>
+        warning.includes("severity.changeConditions"),
+      ),
+    ).toBe(true);
   });
 
   test("keeps valid findings and skips malformed or duplicate findings", async () => {
@@ -749,6 +886,233 @@ describe("malformed scan artifact recovery", () => {
     }
   });
 
+  test("backfills a missing taxonomy.cwe instead of discarding the finding", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+
+    const missingCwe = structuredClone(document.findings[0]!);
+    missingCwe.identity.anchor = "missing-cwe";
+    const taxonomy = (missingCwe as Record<string, unknown>)[
+      "taxonomy"
+    ] as Partial<{ cwe: string[] }>;
+    delete taxonomy.cwe;
+    document.findings.push(missingCwe);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(2);
+    expect(completed.warnings).toHaveLength(1);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("backfilled missing taxonomy.cwe"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings.find(
+      (finding) => finding?.identity.anchor === "missing-cwe",
+    );
+    expect(recovered).toBeDefined();
+    expect((recovered as Record<string, unknown>)?.["taxonomy"]).toMatchObject({
+      cwe: [],
+    });
+  });
+
+  test("drops schema-invalid codeEvidence and prunes the rootCause references it strands", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+
+    const malformedEvidence = structuredClone(document.findings[0]!);
+    malformedEvidence.identity.anchor = "malformed-evidence";
+    (malformedEvidence as Record<string, unknown>)["codeEvidence"] = [
+      // Missing the required `explanation` field, so the JSON-schema pass
+      // rejects it while the hand-rolled validator would accept it.
+      {
+        id: "ev1",
+        label: "sink",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+      },
+    ];
+    (malformedEvidence as Record<string, unknown>)["rootCause"] = {
+      summary: "Dangling reference regression check.",
+      evidenceRefs: ["ev1"],
+    };
+    document.findings.push(malformedEvidence);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(2);
+    expect(completed.warnings).toHaveLength(2);
+    expect(
+      completed.warnings.filter((warning) =>
+        warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling rootCause.evidenceRefs"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings.find(
+      (finding) => finding?.identity.anchor === "malformed-evidence",
+    );
+    expect(recovered).toBeDefined();
+    expect(recovered).not.toHaveProperty("codeEvidence");
+    expect((recovered as Record<string, unknown>)?.["rootCause"]).toMatchObject(
+      { evidenceRefs: [] },
+    );
+  });
+
+  test("drops duplicate codeEvidence ids and prunes nested attackPath references", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+
+    // Duplicate ids are caught by the hand-rolled validator rather than the
+    // JSON-schema pass, so this exercises the other detection path. The
+    // stranded references also live in the nested
+    // `attackPath.dataflow.evidenceRefs` location, not just the top level.
+    const duplicateEvidence = structuredClone(document.findings[0]!);
+    duplicateEvidence.identity.anchor = "duplicate-evidence";
+    (duplicateEvidence as Record<string, unknown>)["codeEvidence"] = [
+      {
+        id: "ev1",
+        label: "a",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+        explanation: "first",
+      },
+      {
+        id: "ev1",
+        label: "b",
+        path: "src/extract.py",
+        startLine: 2,
+        code: "y = 2",
+        explanation: "second",
+      },
+    ];
+    (duplicateEvidence as Record<string, unknown>)["attackPath"] = {
+      summary: "Nested dangling reference regression check.",
+      dataflow: {
+        summary: "source -> sink",
+        source: "input",
+        sink: "output",
+        outcome: "impact",
+        evidenceRefs: ["ev1"],
+      },
+      evidenceRefs: ["ev1"],
+    };
+    document.findings.push(duplicateEvidence);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(2);
+    expect(completed.warnings).toHaveLength(3);
+    expect(
+      completed.warnings.filter((warning) =>
+        warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling attackPath.evidenceRefs"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling attackPath.dataflow.evidenceRefs"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings.find(
+      (finding) => finding?.identity.anchor === "duplicate-evidence",
+    );
+    expect(recovered).toBeDefined();
+    expect(recovered).not.toHaveProperty("codeEvidence");
+    expect(
+      (recovered as Record<string, unknown>)?.["attackPath"],
+    ).toMatchObject({
+      evidenceRefs: [],
+      dataflow: { evidenceRefs: [] },
+    });
+  });
+
+  test("prunes non-string evidenceRefs entries instead of crashing recovery", async () => {
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "findings.json");
+    const document = await readJson<FindingsDocument>(path);
+    const valid = document.findings[0]!;
+
+    // codeEvidence is malformed so it gets stripped, and evidenceRefs mixes a
+    // valid string with unhashable (object/array) and non-string (number)
+    // garbage that a malfunctioning producer could emit. Recovery must prune
+    // these rather than crash when testing set membership.
+    const garbageRefs = structuredClone(valid);
+    garbageRefs.identity.anchor = "garbage-evidence-refs";
+    (garbageRefs as Record<string, unknown>)["codeEvidence"] = [
+      {
+        id: "ev1",
+        label: "sink",
+        path: "src/extract.py",
+        startLine: 1,
+        code: "x = 1",
+      },
+    ];
+    (garbageRefs as Record<string, unknown>)["rootCause"] = {
+      summary: "Non-string evidenceRefs regression check.",
+      evidenceRefs: ["ev1", { nested: "garbage" }, ["nested", "garbage"], 42],
+    };
+
+    document.findings.push(garbageRefs);
+    await writeJson(path, document);
+
+    const completed = await completeScan(fixture);
+
+    expect(completed.progress.status).toBe("complete");
+    expect(completed.findingCount).toBe(2);
+    expect(
+      completed.warnings.some((warning) =>
+        warning.startsWith("Skipped malformed codeEvidence for finding"),
+      ),
+    ).toBe(true);
+    expect(
+      completed.warnings.some(
+        (warning) =>
+          warning.includes("Recovered finding") &&
+          warning.includes("dropped dangling rootCause.evidenceRefs"),
+      ),
+    ).toBe(true);
+
+    const recovered = (await readJson<FindingsDocument>(path)).findings;
+    const garbageRefsRecovered = recovered.find(
+      (finding) => finding?.identity.anchor === "garbage-evidence-refs",
+    );
+    expect(garbageRefsRecovered).toBeDefined();
+    expect(garbageRefsRecovered).not.toHaveProperty("codeEvidence");
+    expect(
+      (garbageRefsRecovered as Record<string, unknown>)?.["rootCause"],
+    ).toMatchObject({ evidenceRefs: [] });
+  });
+
   test("keeps verified coverage receipts and downgrades invalid coverage", async () => {
     const fixture = await startDraftScan();
     const path = join(fixture.scanDir, "coverage.json");
@@ -879,4 +1243,30 @@ describe("malformed scan artifact recovery", () => {
     await expect(completeScan(fixture)).rejects.toThrow("inventoryStrategy");
     expect(await readFile(path, "utf8")).toBe(original);
   });
+
+  test.each(["complete-scan", "prepare-scan-completion"] as const)(
+    "keeps a repairable %s contract failure resumable",
+    async (command) => {
+      const fixture = await startDraftScan();
+      const path = join(fixture.scanDir, "coverage.json");
+      const document = await readJson<CoverageDocument>(path);
+      const validInventoryStrategy = document.inventoryStrategy;
+      document.inventoryStrategy = "";
+      await writeJson(path, document);
+
+      await expect(
+        workbench(fixture, [command, "--scan-id", fixture.scanId]),
+      ).rejects.toThrow("inventoryStrategy");
+      const pending = await workbench(fixture, [
+        "get-scan",
+        "--scan-id",
+        fixture.scanId,
+      ]);
+      expect((pending["scan"] as ScanSummary).progress.status).toBe("running");
+
+      document.inventoryStrategy = validInventoryStrategy;
+      await writeJson(path, document);
+      expect((await completeScan(fixture)).findingCount).toBe(1);
+    },
+  );
 });
